@@ -1,0 +1,40 @@
+version: "3.3"
+
+networks:
+  sbitd_regtest_network:
+volumes:
+  sbitd_regtest_volume:
+
+services:
+  janus_regtest:
+    image: sbit/janus:dev
+    container_name: janus_regtest
+    build: 
+        context: ../../
+        cache_from:
+          - golang:1.14-alpine
+    ports:
+        - "22402:22402"
+    environment: 
+        - SBIT_RPC=http://sbit:testpasswd@sbit_regtest:22002
+        - COMPOSE_PROJECT_NAME=regtest
+    volumes:
+        - ../standalone/myaccounts.txt:$GOPATH/github.com/SBit-Project/janus/myaccounts.txt
+        - ../../https:/https
+        - ../../logs:/logs
+    depends_on:
+      - sbit_regtest
+    command: --bind 0.0.0.0 --accounts $GOPATH/github.com/SBit-Project/janus/myaccounts.txt --log-file /logs/janusLogs.txt --dev --https-key /https/key.pem --https-cert /https/cert.pem
+    networks:
+      - sbitd_regtest_network
+
+  sbit_regtest:
+    ports:
+      - "22002:22002"
+    image: sbit/sbit
+    container_name: sbit_regtest
+    command: sbitd -regtest -txindex -addrindex=1 -rpcbind=0.0.0.0:22002 -rpcallowip=0.0.0.0/0 -logevents -rpcuser=sbit -rpcpassword=testpasswd -deprecatedrpc=accounts -printtoconsole
+    volumes:
+      - sbitd_regtest_volume:/root/.sbit
+    networks:
+      - sbitd_regtest_network

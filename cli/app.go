@@ -1,0 +1,182 @@
+package cli
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"io"
+	"os"
+
+	"github.com/SBit-Project/janus/pkg/notifier"
+	"github.com/SBit-Projectt/janus/pkg/params"
+	"github.com/SBit-Projectt/janus/pkg/sbit"
+	"github.com/SBit-Projectt/janus/pkg/server"
+	"github.com/SBit-Projectt/janus/pkg/transformer"
+	"github.com/btcsuite/btcutil"
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
+	"github.com/pkg/errors"
+	"gopkg.in/alecthomas/kingpin.v2"
+)
+
+var (
+	app = kingpin.New("janus", "Sbit adapter to Ethereum JSON RPC")
+
+	accountsFile = app.Flag("accounts", "account private keys (in WIF) returned by eth_accounts").Envar("ACCOUNTS").File()
+
+	sbitRPC             = app.Flag("sbit-rpc", "URL of sbit RPC service").Envar("SBIT_RPC").Default("").String()
+	sbitNetwork         = app.Flag("sbit-network", "if 'regtest' (or connected to a regtest node with 'auto') Janus will generate blocks").Envar("SBIT_NETWORK").Default("auto").String()
+	generateToAddressTo = app.Flag("generateToAddressTo", "[regtest only] configure address to mine blocks to when mining new transactions in blocks").Envar("GENERATE_TO_ADDRESS").Default("").String()
+	bind                = app.Flag("bind", "network interface to bind to (e.g. 0.0.0.0) ").Default("localhost").String()
+	port                = app.Flag("port", "port to serve proxy").Default("22402").Int()
+	httpsKey            = app.Flag("https-key", "https keyfile").Default("").String()
+	httpsCert           = app.Flag("https-cert", "https certificate").Default("").String()
+	logFile             = app.Flag("log-file", "write logs to a file").Envar("LOG_FILE").Default("").String()
+	matureBlockHeight   = app.Flag("mature-block-height-override", "override how old a coinbase/coinstake needs to be to be considered mature enough for spending (SBIT uses 2000 blocks after the 32s block fork) - if this value is incorrect transactions can be rejected").Int()
+
+	devMode        = app.Flag("dev", "[Insecure] Developer mode").Envar("DEV").Default("false").Bool()
+	singleThreaded = app.Flag("singleThreaded", "[Non-production] Process RPC requests in a single thread").Envar("SINGLE_THREADED").Default("false").Bool()
+
+	ignoreUnknownTransactions = app.Flag("ignoreTransactions", "[Development] Ignore transactions inside blocks we can't fetch and return responses instead of failing").Default("false").Bool()
+	disableSnipping           = app.Flag("disableSnipping", "[Development] Disable ...snip... in logs").Default("false").Bool()
+	hideSbitdLogs             = app.Flag("hideSbitdLogs", "[Development] Hide SBITD debug logs").Envar("HIDE_SBITD_LOGS").Default("false").Bool()
+)
+
+func loadAccounts(r io.Reader, l log.Logger) sbit.Accounts {
+	var accounts sbit.Accounts
+
+	if accountsFile != nil {
+		s := bufio.NewScanner(*accountsFile)
+		for s.Scan() {
+			line := s.Text()
+
+			wif, err := btcutil.DecodeWIF(line)
+			if err != nil {
+				level.Error(l).Log("msg", "Failed to parse account", "err", err.Error())
+				continue
+			}
+
+			accounts = append(accounts, wif)
+		}
+	}
+
+	if len(accounts) > 0 {
+		level.Info(l).Log("msg", fmt.Sprintf("Loaded %d accounts", len(accounts)))
+	} else {
+		level.Warn(l).Log("msg", "No accounts loaded from account file")
+	}
+
+	return accounts
+}
+
+func action(pc *kingpin.ParseContext) error {
+	addr := fmt.Sprintf("%s:%d", *bind, *port)
+	writers := []io.Writer{os.Stdout}
+
+	if logFile != nil && (*logFile) != "" {
+		_, err := os.Stat(*logFile)
+		if os.IsNotExist(err) {
+			newLogFile, err := os.Create(*logFile)
+			if err != nil {
+				return errors.Wrapf(err, "Failed to create log file %s", *logFile)
+			} else {
+				writers = append(writers, newLogFile)
+			}
+		} else {
+			existingLogFile, err := os.Open(*logFile)
+			if err != nil {
+				return errors.Wrapf(err, "Failed to open log file %s", *logFile)
+			} else {
+				writers = append(writers, existingLogFile)
+			}
+		}
+	}
+
+	logWriter := io.MultiWriter(writers...)
+	logger := log.NewLogfmtLogger(logWriter)
+
+	if !*devMode {
+		logger = level.NewFilter(logger, level.AllowWarn())
+	}
+
+	var accounts sbit.Accounts
+	if *accountsFile != nil {
+		accounts = loadAccounts(*accountsFile, logger)
+		(*accountsFile).Close()
+	}
+
+	isMain := *sbitNetwork == sbit.ChainMain
+
+	sbitJSONRPC, err := sbit.NewClient(
+		isMain,
+		*sbitRPC,
+		sbit.SetDebug(*devMode),
+		sbit.SetLogWriter(logWriter),
+		sbit.SetLogger(logger),
+		sbit.SetAccounts(accounts),
+		sbit.SetGenerateToAddress(*generateToAddressTo),
+		sbit.SetIgnoreUnknownTransactions(*ignoreUnknownTransactions),
+		sbit.SetDisableSnippingSbitRpcOutput(*disableSnipping),
+		sbit.SetHideSbitdLogs(*hideSbitdLogs),
+		sbit.SetMatureBlockHeight(matureBlockHeight),
+		sbit.SetContext(context.Background()),
+	)
+	if err != nil {
+		return errors.Wrap(err, "Failed to setup SBIT client")
+	}
+
+	sbitClient, err := sbit.New(sbitJSONRPC, *sbitNetwork)
+	if err != nil {
+		return errors.Wrap(err, "Failed to setup SBIT chain")
+	}
+
+	agent := notifier.NewAgent(context.Background(), sbitClient, nil)
+	proxies := transformer.DefaultProxies(sbitClient, agent)
+	t, err := transformer.New(
+		sbitClient,
+		proxies,
+		transformer.SetDebug(*devMode),
+		transformer.SetLogger(logger),
+	)
+	if err != nil {
+		return errors.Wrap(err, "transformer#New")
+	}
+	agent.SetTransformer(t)
+
+	httpsKeyFile := getEmptyStringIfFileDoesntExist(*httpsKey, logger)
+	httpsCertFile := getEmptyStringIfFileDoesntExist(*httpsCert, logger)
+
+	s, err := server.New(
+		sbitClient,
+		t,
+		addr,
+		server.SetLogWriter(logWriter),
+		server.SetLogger(logger),
+		server.SetDebug(*devMode),
+		server.SetSingleThreaded(*singleThreaded),
+		server.SetHttps(httpsKeyFile, httpsCertFile),
+	)
+	if err != nil {
+		return errors.Wrap(err, "server#New")
+	}
+
+	return s.Start()
+}
+
+func getEmptyStringIfFileDoesntExist(file string, l log.Logger) string {
+	_, err := os.Stat(file)
+	if os.IsNotExist(err) {
+		l.Log("file does not exist", file)
+		return ""
+	}
+	return file
+}
+
+func Run() {
+	app.Version(params.VersionWithGitSha)
+	kingpin.MustParse(app.Parse(os.Args[1:]))
+}
+
+func init() {
+	app.Action(action)
+}

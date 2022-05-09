@@ -1,0 +1,42 @@
+version: "3.3"
+services:
+  janus:
+    image: sbit/janus:dev
+    build:
+      context: ../../
+      dockerfile: ./Dockerfile
+      cache_from:
+        - golang:1.14-alpine
+        - sbit/janus:dev
+    ports:
+      - "22402:22402"
+    environment:
+      - SBIT_RPC=http://sbit:testpasswd@sbit:22002
+    volumes:
+      - ../standalone/myaccounts.txt:$GOPATH/github.com/SBit-Project/janus/myaccounts.txt
+    depends_on:
+      - sbit
+    command: --bind 0.0.0.0 --accounts /go/src/github.com/SBit-Project/janus/myaccounts.txt --dev
+  sbit:
+    ports:
+      - "22002:22002"
+    image: sbit/sbit-seeded
+    build:
+      context: ../../docker
+      dockerfile: ./sbit-seeded.Dockerfile
+      cache_from:
+        - sbit/sbit-seeded
+    container_name: sbit_seeded_testchain
+    command: sbitd -regtest -addrindex -txindex -rpcbind=0.0.0.0:22002 -rpcallowip=0.0.0.0/0 -logevents -rpcuser=sbit -rpcpassword=testpasswd -deprecatedrpc=accounts -printtoconsole
+  openzeppelin:
+    image: sbit/janus-openzeppelin
+    build:
+      context: .
+      dockerfile: ./openzeppelin.Dockerfile
+      cache_from:
+        - sbit/janus-openzeppelin
+    environment:
+      - GENERATE_TO_ADDRESS=qW28njWueNpBXYWj2KDmtFG2gbLeALeHfV
+    depends_on:
+      - janus
+    command: truffle test --network docker

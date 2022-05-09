@@ -1,0 +1,9 @@
+#ingore testing components
+/testing
+/playground
+/metamask
+/https
+/logs
+/.vscode
+/.idea
+janusLogs.txt
