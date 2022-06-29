@@ -11,7 +11,7 @@
 
 <script>
 let SBITMainnet = {
-  chainId: '0x22B8', // 8888
+  chainId: '0x51', // 81
   chainName: 'SBIT Mainnet',
   rpcUrls: ['https://janus.siswap.com/api/'],
   blockExplorerUrls: ['https://mainnet.sbit.dev/'],
@@ -53,7 +53,7 @@ let SBITRegTest = {
   },
 };
 let config = {
-  "0x22B8": SBITMainnet,
+  "0x51": SBITMainnet,
   "0x22B9": SBITTestNet,
   "0x22BA": SBITRegTest,
 };
